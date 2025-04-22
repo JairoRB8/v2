@@ -3,6 +3,7 @@ import json
 import time
 import os
 import re
+from docx.shared import Inches
 import sys
 import docx
 from docx.document import Document
@@ -218,50 +219,59 @@ def get_gemini_analysis(test_case_data: dict) -> dict | None:
     Focus on identifying:
     1.  **Test Type:** Confirm the likely test type (Functional, Performance, Inspection) based on the provided 'identified_test_type'.
     2.  **Equipment List:** Extract the names of all necessary equipment from the 'setup_section'.
-    3.  **General Information:** Extract the Test Case ID, Test ID (often in refs or custom_test_id), and formulate the main title line combining ID, title, and refs.
-    4.  **Results Table Headers:** Analyze the 'steps_expected' list (both 'content' and 'expected' fields). Identify *all* specific data points, conditions, or checks that the test executor needs to explicitly record or verify. Create a list of concise, descriptive column headers for the main results table(s).
-        *   Always include standard columns: "No.", "Infuser Serial Number", "Sign Name/Date". Include "Battery Serial Number" if batteries are mentioned. Include "Stopwatch Cal_ID / Calibration Due Date" if a stopwatch is mentioned.
-        *   Look for phrases like "Record the results", "Verify that [condition]", "Record the value", "Check [parameter]", "Time recorded", etc.
-        *   If multiple distinct sets of results are recorded in different steps (e.g., testing different rates or conditions separately), create a separate list of headers for *each* distinct results table needed. Title each table appropriately (e.g., "TABLE 1. REQUIREMENT [REQ_ID] CONDITION VERIFICATION", "TABLE 2. REQUIREMENT [REQ_ID] CONDITION VERIFICATION"). Infer REQ_ID association if possible.
-        *   For 'Performance' tests, specifically look for numerical values to be recorded and potentially Upper/Lower Specification Limits (USL/LSL) mentioned in 'expected'. Headers might be like "Measured Value (unit)", "USL", "LSL".
-        *   For 'Inspection' tests, headers might be simpler like "Document Reviewed", "Section/Clause", "Requirement Met (Pass/Fail)".
-    5.  **Requirements Summary:** Analyze the 'expected' fields. For each requirement ID listed in 'requirements', extract the core verification condition text (the part after "...as a 'Pass' if..."). Create a list of objects, each containing the 'req_id' and its corresponding 'verification_text'. Determine the 'step' and 'sub_step' associated with the verification if mentioned in the 'expected' text.
+    3.  **General Information:** Extract the Test Case ID (prefix with 'C'), Test ID (often in refs or custom_test_id), and formulate the main title line combining ID, title, and refs.
+    4.  **Results Table Structure (`results_tables` list):** This is critical. Analyze the 'steps_expected' ('content' and 'expected') to determine the necessary results tables and their column headers.
+        *   **Identify Recording Actions:** Find *every* instance requiring data recording or verification per sample (e.g., "Record...", "Verify...", "Check...", "Time recorded...").
+        *   **Determine Columns:** For each table:
+            *   Start with `"No."`.
+            *   Add columns for essential identifiers mentioned in setup or steps that need recording per sample (e.g., "Infuser Serial Number", "Battery Serial Number", "Flatbed Serial Number", "Stopwatch Cal_ID / Calibration Due Date"). Determine these dynamically based on the test case context.
+            *   Add a distinct column for *each* condition, check, or measurement identified in the recording actions.
+            *   End with `"Sign Name/Date"`.
+        *   **Header Formatting:**
+            *   For standard columns like "No.", device serial numbers, calibration info, and "Sign Name/Date", the header string in the JSON list should be **single-line** (e.g., `"No."`, `"Battery Serial Number"`, `"Sign Name/Date"`).
+            *   For condition/check/measurement columns, the header string in the JSON list MUST be **three lines separated by '\\n'**:
+                *   Line 1: Concise prose description (e.g., "Time Charging Current Dropped to 0mA (hh:mm:ss)", "Verify Module Presence (Pass/Fail)"). Include units for measurements. Use "(Pass/Fail)" only if the direct result recorded IS pass/fail.
+                *   Line 2: Step reference (e.g., "Step 1 Sub-step 8"). Extract from the corresponding step content.
+                *   Line 3: Requirement ID and type (e.g., "CADD-SYSDI-73 (condition)", "CADD-HWDI-EC-137 (verification)").
+            *   **Example AI Header List:** `["No.", "Infuser Serial Number", "Time Dropped (s)\\nStep 2 Sub-step 5\\nCADD-REQ-101 (condition)", "Verify Alarm (Pass/Fail)\\nStep 2 Sub-step 6\\nCADD-REQ-101 (verification)", "Sign Name/Date"]`
+        *   **Table Splitting:** If the total number of columns (including standard/equipment/conditions) exceeds a threshold (e.g., 10 columns), split the *condition* columns into multiple tables.
+            *   Generate a separate entry in the `results_tables` list for each split table.
+            *   Each split table MUST contain `"No."`, relevant equipment ID column(s), the subset of condition columns, and `"Sign Name/Date"`.
+            *   Adjust the table titles accordingly (e.g., "TABLE 1. REQUIREMENTS ... PART 1", "TABLE 2. REQUIREMENTS ... PART 2").
+        *   **Table Title:** Generate an appropriate title for each results table (e.g., "TABLE 1. REQUIREMENT [REQ_ID] CONDITION VERIFICATION" or including multiple Req IDs if applicable).
+    5.  **Requirements Summary:** Analyze the 'expected' fields. For each requirement ID listed in 'requirements', extract the core verification condition text (the part after "...as a 'Pass' if..."). **Do NOT include step/sub-step numbers in the `verification_text`**. Create a list of objects, each containing `req_id`, `verification_text`, and the associated `step` and `sub_step` numbers (as separate fields).
 
-    **Output Format:** Return the analysis strictly as a JSON object with the following structure:
-
+    **Output Format:** Return the analysis strictly as a JSON object:
     ```json
     {
       "test_type": "Functional | Performance | Inspection | Unknown",
       "general_info": {
-        "title_line": "string", // e.g., "C12345: 'Title...' (REQ-001, REQ-002)."
-        "test_case_id": "string", // e.g., "12345"
-        "test_id": "string" // e.g., "REQ-001.1" or "N/A"
+        "title_line": "string",
+        "test_case_id": "string", // Number only, code will add 'C'
+        "test_id": "string"
       },
-      "equipment": [ // List of equipment names found in setup
-        "string",
-        ...
-      ],
-      "results_tables": [ // List of objects, one for each distinct results table needed
+      "equipment": ["string", ...],
+      "results_tables": [
         {
-          "title": "string", // e.g., "TABLE 1. REQUIREMENT CADD-SYSDI-1137 CONDITION VERIFICATION"
-          "headers": ["string", ...], // List of column header strings
-          "num_rows": number // Typically 30 for Performance, 29 for Functional, 1 or more for Inspection based on steps
+          "title": "string", // Title for this specific table
+          "headers": ["string", ...], // List of header strings (single or multi-line as specified)
+          "num_rows": number // Functional=29, Performance=30, Inspection=1+
         },
+        // Add more table objects here if splitting is needed
         ...
       ],
-      "requirements_summary": [ // List of objects, one for each requirement verified
+      "requirements_summary": [
         {
-          "step": "string", // Step number from 'expected' text (e.g., "1", "2") or "N/A"
-          "sub_step": "string", // Sub-step number, if applicable (e.g., "14") or "N/A"
-          "req_id": "string", // e.g., "CADD-SYSDI-1137"
-          "verification_text": "string" // The core condition text
+          "step": "string", // "N/A" if not found
+          "sub_step": "string", // "N/A" if not found
+          "req_id": "string",
+          "verification_text": "string" // Core condition text ONLY
         },
         ...
       ]
     }
     ```
-
-    Be precise and adhere strictly to the JSON format. If information isn't clearly present, use reasonable defaults like "N/A" or base `num_rows` on typical test types (Functional: 29, Performance: 30, Inspection: 1). Combine related verification checks into single headers where logical (e.g., "Verify 'NCB DIS' and battery charge displayed").
+    Be precise. Ensure header format rules (single vs. multi-line) are followed. Dynamically determine equipment columns. Split tables correctly if needed.
     """
 
     user_content = f"""Analyze the following TestRail test case data and generate the JSON structure for its corresponding record file:
@@ -336,12 +346,12 @@ class RecordFileGenerator:
 
         # --- Define FIXED Element Indices & Coordinates (Updated based on parser dump) ---
         self.TITLE_PARA_INDEX = 0
-        self.GENERAL_INFO_TABLE_INDEX = 1 # The actual index in doc.tables
+        self.GENERAL_INFO_TABLE_INDEX = 0 # The actual index in doc.tables
 
         # Coordinates within General Info Table (Table at index 1)
         # Adjusted to target the start of visually merged cells based on dump/PDF
-        self.TC_ID_CELL = (11, 18) # Row 11, Col 18
-        self.TEST_ID_CELL = (12, 18) # Row 12, Col 18
+        self.TC_ID_CELL = (11, 23) # Row 11, Col 18
+        self.TEST_ID_CELL = (12, 23) # Row 12, Col 18
 
         # --- Constants for finding other tables DYNAMICALLY ---
         self.EQUIPMENT_TABLE_SEARCH_HEADER = "Equipment and Material Description"
@@ -438,37 +448,126 @@ class RecordFileGenerator:
         except Exception as e:
             print(f"  Error populating title: {e}")
 
+    def populate_header(self):
+        """ Populates the Test Case ID placeholder in the document header. """
+        print("--- Populating Document Header ---")
+        try:
+            if not self.doc.sections:
+                print("  Warning: Document has no sections. Cannot access header.")
+                return
+
+            section = self.doc.sections[0]
+            header = section.header
+
+            if not header:
+                print("  Warning: Section 0 has no header part.")
+                return
+
+            tc_id_raw = self.ai_analysis.get('general_info', {}).get('test_case_id', 'CXXXXX')
+            tc_id = f"C{tc_id_raw}" if tc_id_raw != 'CXXXXX' and not str(tc_id_raw).startswith('C') else tc_id_raw # Prepend 'C' if needed
+            placeholder = "CXXXXX"
+            replacement_done = False
+
+            # Find the specific paragraph containing the placeholder
+            target_para = None
+            for para in header.paragraphs:
+                if placeholder in para.text:
+                    target_para = para
+                    print(f"  Found target paragraph in header: '{target_para.text[:60]}...'")
+                    break # Found the paragraph, stop searching
+
+            if target_para:
+                # Perform replacement within the runs of the target paragraph only
+                inline = target_para.runs
+                for i in range(len(inline)):
+                    if placeholder in inline[i].text:
+                        text = inline[i].text.replace(placeholder, str(tc_id)) # Use modified tc_id
+                        inline[i].text = text
+                        replacement_done = True
+                        print(f"    Replaced placeholder in run {i}. New text: '{inline[i].text}'")
+                        # Optional: break here if you only expect one occurrence per paragraph
+                        # break
+                # Fallback if runs didn't contain it directly (less likely but possible)
+                if not replacement_done and placeholder in target_para.text:
+                    print("    Placeholder found in paragraph text but not runs, attempting direct text replacement (may affect formatting).")
+                    target_para.text = target_para.text.replace(placeholder, str(tc_id)) # Use modified tc_id
+                    replacement_done = True
+
+            if not replacement_done:
+                print(f"  Warning: Placeholder '{placeholder}' not found or replaced in header paragraphs.")
+
+        except Exception as e:
+            print(f"  Error populating header: {e}")
+            import traceback
+            traceback.print_exc()
     def populate_general_info(self):
         """ Populates fields in the General Information table (Table at index 1). """
         print("--- Populating General Info Table ---")
         try:
-            # Access table by its known index (less prone to failure than dynamic find here)
+            # Access table by its known index
             if self.GENERAL_INFO_TABLE_INDEX < len(self.doc.tables):
-                 table0 = self.doc.tables[self.GENERAL_INFO_TABLE_INDEX]
-                 gen_info = self.ai_analysis.get('general_info', {})
-                 tc_id = gen_info.get('test_case_id', 'N/A')
-                 test_id = gen_info.get('test_id', 'N/A')
+                table0 = self.doc.tables[self.GENERAL_INFO_TABLE_INDEX]
+                print(f"  Accessed Table {self.GENERAL_INFO_TABLE_INDEX}. Rows: {len(table0.rows)}, Cols: {len(table0.columns)}") # DEBUG: Print dimensions
 
-                 # Use updated cell coordinates
-                 try:
-                     set_cell_text(table0.cell(self.TC_ID_CELL[0], self.TC_ID_CELL[1]), tc_id)
-                     print(f"  Populated Test Case ID at {self.TC_ID_CELL}: {tc_id}")
-                 except IndexError:
-                      print(f"  Error: Cell index {self.TC_ID_CELL} out of range for Test Case ID in Table {self.GENERAL_INFO_TABLE_INDEX}.")
-                 try:
-                      set_cell_text(table0.cell(self.TEST_ID_CELL[0], self.TEST_ID_CELL[1]), test_id)
-                      print(f"  Populated Test ID at {self.TEST_ID_CELL}: {test_id}")
-                 except IndexError:
-                      print(f"  Error: Cell index {self.TEST_ID_CELL} out of range for Test ID in Table {self.GENERAL_INFO_TABLE_INDEX}.")
+                # --- DEBUG: Inspect Row 11 ---
+                target_row_index = 11
+                if target_row_index < len(table0.rows):
+                    print(f"  Inspecting Row {target_row_index}:")
+                    row11 = table0.rows[target_row_index]
+                    print(f"    Number of cells in row {target_row_index}: {len(row11.cells)}")
+                    for c_idx, cell in enumerate(row11.cells):
+                        # Get text, handling potential errors
+                        try:
+                            cell_text = cell.text.strip().replace('\n', ' ')
+                        except Exception as e:
+                            cell_text = f"[Error reading cell: {e}]"
+                        print(f"      Cell({target_row_index}, {c_idx}): '{cell_text[:50]}...'") # Limit text length
+                else:
+                    print(f"  Error: Row index {target_row_index} is out of bounds for table {self.GENERAL_INFO_TABLE_INDEX}.")
+                # --- END DEBUG ---
+
+                gen_info = self.ai_analysis.get('general_info', {})
+                tc_id = gen_info.get('test_case_id', 'N/A')
+                test_id = gen_info.get('test_id', 'N/A') # Assuming Test ID still goes below TC ID
+                tc_id_raw = gen_info.get('test_case_id', 'N/A')
+                tc_id = f"C{tc_id_raw}" if tc_id_raw != 'N/A' and not str(tc_id_raw).startswith('C') else tc_id_raw # Prepend 'C' if needed
+                # Try writing to the cells again (using the coordinates from __init__)
+                # We still *expect* (11, 18) and (12, 18) to be the logical targets
+                # The debug output above might give clues if these are wrong
+                try:
+                    # Make sure row 11 exists before accessing
+                    if self.TC_ID_CELL[0] < len(table0.rows):
+                        set_cell_text(table0.cell(self.TC_ID_CELL[0], self.TC_ID_CELL[1]), tc_id) # Use the modified tc_id
+                        print(f"  Populated Test Case ID at {self.TC_ID_CELL}: {tc_id}")
+                    else:
+                        print(f"  Error: Row index {self.TC_ID_CELL[0]} out of range for Test Case ID.")
+                except IndexError:
+                    print(f"  IndexError: Could not write to Cell index {self.TC_ID_CELL} for Test Case ID in Table {self.GENERAL_INFO_TABLE_INDEX}.")
+
+                # Test ID (assuming it goes in row 12, same starting column)
+                target_test_id_cell = (self.TEST_ID_CELL[0], self.TEST_ID_CELL[1]) # Use coordinates from __init__
+                try:
+                    # Make sure row 12 exists
+                    if target_test_id_cell[0] < len(table0.rows):
+                        set_cell_text(table0.cell(target_test_id_cell[0], target_test_id_cell[1]), test_id)
+                        print(f"  Attempted to populate Test ID at {target_test_id_cell}: {test_id}")
+                    else:
+                        print(f"  Error: Row index {target_test_id_cell[0]} out of range for Test ID.")
+                except IndexError:
+                    print(f"  IndexError: Could not write to Cell index {target_test_id_cell} for Test ID in Table {self.GENERAL_INFO_TABLE_INDEX}.")
+
             else:
-                 print(f"  Error: Table index {self.GENERAL_INFO_TABLE_INDEX} out of range for General Info.")
+                print(f"  Error: Table index {self.GENERAL_INFO_TABLE_INDEX} out of range for General Info.")
         except Exception as e:
             print(f"  Error populating General Info table: {e}")
+            import traceback
+            traceback.print_exc()
 
     def populate_equipment(self):
-        """ Populates the Equipment table (Found dynamically). """
-        print("--- Populating Equipment Table ---")
+        """ Clears existing equipment data rows (if any), populates with AI-identified equipment, and applies a standard table style. """
+        print("--- Populating Equipment Table (Replacing Template Rows & Applying Style) ---")
         try:
+            # Find the table using header content
             table1 = self._find_table_by_header_content(self.EQUIPMENT_TABLE_SEARCH_HEADER)
             if not table1:
                 print("  Error: Equipment table not found using header search.")
@@ -476,50 +575,60 @@ class RecordFileGenerator:
 
             equipment_list = self.ai_analysis.get('equipment', [])
             if not equipment_list:
-                print("  Warning: Equipment list not found in AI analysis, attempting to parse from setup text.")
-                equipment_list = parse_setup_equipment(self.testrail_data.get('custom_tc_setup', ''))
+                # Fallback (optional, keep if desired)
+                # print("  Warning: Equipment list not found in AI analysis, attempting to parse from setup text.")
+                # equipment_list = parse_setup_equipment(self.testrail_data.get('custom_tc_setup', ''))
+                print("  No equipment identified by AI or setup text.")
+                # Decide if you still want to clear template rows even if no equipment is found
+                # For now, let's just return if no equipment is to be added.
+                return # Exit if no equipment
 
             print(f"  Equipment to populate: {equipment_list}")
-            found_items_in_table = []
-            remaining_equipment = list(equipment_list) # Copy list to modify
 
-            for r in range(self.EQUIPMENT_START_DATA_ROW, min(self.EQUIPMENT_END_DATA_ROW + 1, len(table1.rows))):
+            # --- Clear any existing data rows (just in case template wasn't fully cleaned) ---
+            header_row_count = 1 # Assuming 1 header row
+            while len(table1.rows) > header_row_count:
+                row_to_remove = table1.rows[-1]
+                row_element = row_to_remove._element
+                if row_element.getparent() is not None:
+                    row_element.getparent().remove(row_element)
+                else:
+                    break
+            print(f"  Cleared any pre-existing data rows. Table rows now: {len(table1.rows)}")
+
+            # --- Add new rows for each piece of equipment ---
+            for eq_name in equipment_list:
                 try:
-                    cell_obj = table1.cell(r, self.EQUIPMENT_NAME_COL)
-                    cell_text = "".join([p.text for p in cell_obj.paragraphs]).strip()
-
-                    if not cell_text: continue
-
-                    matched_eq = None
-                    for eq_name in remaining_equipment:
-                        # Clean both strings thoroughly for comparison
-                        clean_cell_text = re.sub(r'\W+', '', cell_text).lower() # Remove non-alphanumeric
-                        clean_eq_name = re.sub(r'\W+', '', eq_name).lower() # Remove non-alphanumeric
-
-                        # Use startswith after cleaning for potentially more reliable matching
-                        if clean_cell_text.startswith(clean_eq_name):
-                            matched_eq = eq_name
-                            # print(f"DEBUG: Match Found! EQ: '{eq_name}' vs CELL: '{cell_text}' (Cleaned: '{clean_eq_name}' vs '{clean_cell_text}')") # Debug Print
-                            break # Found match for this row
-
-                    if matched_eq:
-                        try:
-                            set_cell_text(table1.cell(r, self.EQUIPMENT_QTY_COL), "[Enter Qty]")
-                            set_cell_text(table1.cell(r, self.EQUIPMENT_PART_COL), "[Enter Part#]")
-                            set_cell_text(table1.cell(r, self.EQUIPMENT_LOT_COL), "[Enter Lot/SN]")
-                            set_cell_text(table1.cell(r, self.EQUIPMENT_CAL_COL), "[Enter Cal/SW]")
-                            found_items_in_table.append(matched_eq)
-                            remaining_equipment.remove(matched_eq) # Remove from list once matched
-                            print(f"  Populated placeholders in row {r} for equipment: '{cell_text}' (matched '{matched_eq}')")
-                        except IndexError:
-                             print(f"  Error: Column index out of range populating placeholders in row {r} for '{matched_eq}'.")
+                    new_row = table1.add_row()
+                    # Populate only the first column (equipment name)
+                    set_cell_text(new_row.cells[self.EQUIPMENT_NAME_COL], eq_name)
+                    # Clear other columns in the new row to ensure they are blank
+                    for c_idx in range(1, len(new_row.cells)):
+                        # Check cell index is valid before accessing
+                        if c_idx < len(new_row.cells):
+                            set_cell_text(new_row.cells[c_idx], "") # Set to empty string
+                        else:
+                            print(f"  Warning: Column index {c_idx} out of range when clearing added row.")
+                    print(f"  Added row for equipment: '{eq_name}'")
                 except IndexError:
-                    print(f"  Warning: Cell index ({r}, {self.EQUIPMENT_NAME_COL}) out of range in Equipment table.")
-                    continue
+                    print(f"  Error: Column index {self.EQUIPMENT_NAME_COL} out of range when adding row for '{eq_name}'.")
+                except Exception as add_e:
+                    print(f"  Error adding row for equipment '{eq_name}': {add_e}")
 
-            print(f"  Finished populating equipment placeholders. Items matched: {len(found_items_in_table)}/{len(equipment_list)}")
-            if remaining_equipment:
-                print(f"  Warning: Equipment items not matched to template rows: {remaining_equipment}")
+            # --- Apply a standard table style AFTER adding all rows ---
+            # 'Table Grid' is a basic style that usually includes all borders.
+            # Other options: 'Light Shading Accent 1', 'Medium Grid 1 Accent 1', etc.
+            # Check Word's Table Design tab for names. Style must exist in the template or Word's defaults.
+            try:
+                target_style = 'RecordHeaderStyle'
+                print(f"  Attempting to apply style '{target_style}' to the equipment table.")
+                table1.style = target_style
+                print(f"  Applied style '{table1.style.name}' to equipment table.") # Verify applied style name
+            except Exception as style_e:
+                print(f"  Warning: Could not apply table style '{target_style}'. Error: {style_e}")
+                print("  Borders might still be missing. Consider checking template's default table style.")
+
+            print(f"  Finished populating equipment table with {len(equipment_list)} items.")
 
         except Exception as e:
             print(f"  Error populating Equipment table: {e}")
@@ -527,148 +636,305 @@ class RecordFileGenerator:
             traceback.print_exc()
 
     def populate_results_tables(self):
-        """ Populates the main results table(s) based on AI analysis (Found dynamically). """
-        print("--- Populating Results Tables ---")
+        """ Populates results tables dynamically, adding columns, setting width/style/formatting. """
+        print("--- Populating Results Tables (Dynamic Columns) ---")
         results_tables_data = self.ai_analysis.get('results_tables', [])
         if not results_tables_data:
             print("  No results table structures found in AI analysis.")
             return
 
-        # Assuming only one results table based on AI output for TC 983037
-        # If AI starts generating multiple, this logic needs a loop and better finding
-        if len(results_tables_data) > 1:
-            print("  Warning: AI generated multiple results tables, but script currently handles only the first.")
+        table_placeholders = [
+            "PLACEHOLDER_RESULTS_TABLE_1",
+            "PLACEHOLDER_RESULTS_TABLE_2",
+        ]
+        default_column_width = Inches(1.0) # Default width used when adding columns
+        target_total_width_inches = 10.0
 
-        table_data = results_tables_data[0]
-        table_title = table_data.get("title", "Results Table 1")
-        headers = table_data.get("headers", [])
-        num_rows = table_data.get("num_rows", 1)
+        for i, table_data in enumerate(results_tables_data):
+            if i >= len(table_placeholders):
+                print(f"  Warning: AI provided data for results table {i+1}, but only {len(table_placeholders)} placeholders defined/found. Skipping.")
+                break
 
-        if not headers:
-            print(f"    Warning: No headers found for table '{table_title}'. Skipping.")
-            return
+            placeholder_text = table_placeholders[i]
+            print(f"\n  Processing Results Table {i+1} (Looking for placeholder '{placeholder_text}')...")
 
-        # Find the table using the preceding paragraph text
-        target_table = self._find_table_by_preceding_paragraph_text(self.RESULTS_TABLE_1_SEARCH_TEXT)
-
-        if not target_table:
-            print(f"  Error: Could not find Results Table 1 using search text '{self.RESULTS_TABLE_1_SEARCH_TEXT}'.")
-            return
-
-        print(f"  Populating Results Table 1 (Found Dynamically). Title: '{table_title}'")
-
-        try:
-            # --- Set Table Title (in preceding paragraph) ---
-            table_element = target_table._element
-            parent = table_element.getparent()
+            target_table = None
             title_para = None
-            if parent is not None:
-                try:
-                    table_xml_index = parent.index(table_element)
-                    if table_xml_index > 0:
-                        preceding_element = parent[table_xml_index - 1]
-                        if isinstance(preceding_element, CT_P):
-                            # Map back to Paragraph object
-                            for p in self.doc.paragraphs:
-                                if p._element == preceding_element:
-                                    title_para = p
-                                    break
-                except ValueError: pass # Ignore if index not found
+            body_elements = list(self.doc.element.body)
+            for elem_idx, element in enumerate(body_elements):
+                if isinstance(element, CT_P):
+                    para = next((p for p in self.doc.paragraphs if p._element == element), None)
+                    if para and placeholder_text in para.text:
+                        title_para = para
+                        if elem_idx + 1 < len(body_elements) and isinstance(body_elements[elem_idx+1], CT_Tbl):
+                            table_element = body_elements[elem_idx+1]
+                            target_table = next((t for t in self.doc.tables if t._element == table_element), None)
+                        break
 
+            if not target_table:
+                print(f"  Error: Could not find table following placeholder '{placeholder_text}'. Skipping Table {i+1}.")
+                continue
+
+            table_title = table_data.get("title", f"Results Table {i+1}")
+            headers = table_data.get("headers", [])
+            num_data_rows = table_data.get("num_rows", 1)
+
+            if not headers:
+                print(f"    Warning: No headers found for table '{table_title}'. Skipping.")
+                continue
+
+            print(f"    Found table. Populating title: '{table_title}' and processing {len(headers)} headers.")
+
+            # --- Set Table Title ---
             if title_para:
-                print(f"    Setting title in preceding paragraph: '{table_title}'")
+                print(f"    Setting title in placeholder paragraph...")
                 for run in title_para.runs: run.clear()
                 title_para.text = table_title
                 if title_para.runs: title_para.runs[0].font.bold = True
             else:
-                print(f"    Warning: No paragraph found directly preceding the results table. Cannot set title paragraph.")
+                print(f"    Warning: Placeholder paragraph not found. Cannot set title.")
 
-            # --- Populate Headers (Handles multi-row headers in template by overwriting Row 0 only) ---
-            if len(target_table.rows) > 0:
-                 header_row = target_table.rows[0] # Target the first row for AI headers
-                 if len(header_row.cells) >= len(headers):
-                      print(f"    Setting headers in row 0: {headers}")
-                      for c_idx, header_text in enumerate(headers):
-                           set_cell_text(header_row.cells[c_idx], header_text)
-                      # Clear any extra template cells in this specific header row
-                      for c_idx in range(len(headers), len(header_row.cells)):
-                           set_cell_text(header_row.cells[c_idx], "")
-                 else:
-                      print(f"    Error: Results table has fewer columns ({len(header_row.cells)}) than headers ({len(headers)}). Cannot set headers.")
-                      return # Stop processing this table
+             # --- Add Columns and Set Widths using EMUs ---
+            num_needed_cols = len(headers)
+            current_cols = len(target_table.columns)
+            num_cols_to_add = num_needed_cols - current_cols
+
+            if num_cols_to_add < 0:
+                print(f"    Warning: Template table {i+1} has more columns ({current_cols}) than AI headers ({num_needed_cols}).")
+                num_cols_to_add = 0
+
+            # --- Set table layout to fixed BEFORE adjusting widths ---
+            try:
+                print("    Setting table layout to fixed.")
+                target_table.autofit = True
+                # Setting overall table width in EMU (optional, but may help)
+                # total_table_width_emu = 9144000 # 10 inches in EMU
+                # target_table.width = total_table_width_emu
+            except Exception as layout_e:
+                print(f"    Warning: Could not set table layout properties: {layout_e}")
+            # ---
+
+            # --- Calculate target width PER COLUMN in EMUs ---
+            calculated_width_per_column_emu = None
+            target_total_width_emu = 9144000 # 10 inches * 914400 EMU/inch
+            if num_needed_cols > 0:
+                try:
+                    # Calculate width as an integer EMU value
+                    calculated_width_per_column_emu = int(target_total_width_emu / num_needed_cols)
+                    print(f"    Calculated width per column: {calculated_width_per_column_emu} EMU (approx {(calculated_width_per_column_emu / 914400):.2f} inches)")
+                except ZeroDivisionError:
+                    print("    Warning: Cannot divide by zero columns for width calculation.")
             else:
-                 print(f"    Error: Results table has no rows. Cannot set headers.")
-                 return # Stop processing this table
+                print("   Warning: Zero columns needed, cannot calculate width.")
+            # --- End EMU Calculation ---
 
-            # --- Manage Data Rows (Corrected logic for start row and removal) ---
-            # Functional template has 3 header rows, data starts index 3.
-            num_template_header_rows = self.RESULTS_TABLE_DATA_START_ROW # 3
-            template_data_rows = len(target_table.rows) - num_template_header_rows
-            rows_to_add = num_rows - template_data_rows # num_rows is *data* rows needed
-            print(f"    Target data rows: {num_rows}. Template has: {template_data_rows}. Need to add: {rows_to_add}")
+            # Default width for adding columns initially (can be small, will be overridden)
+            initial_add_width_emu = 100000 # A small default EMU value
+
+            if num_cols_to_add > 0:
+                print(f"    Adding {num_cols_to_add} columns and setting widths (EMU)...")
+                for col_idx_to_add in range(num_cols_to_add):
+                    try:
+                        # Add the column using the minimal EMU width
+                        new_col_ref = target_table.add_column(initial_add_width_emu)
+
+                        # --- IMMEDIATELY set the calculated EMU width ---
+                        current_col_count = len(target_table.columns)
+                        new_col_index = current_col_count - 1
+                        if calculated_width_per_column_emu is not None:
+                            try:
+                                target_table.columns[new_col_index].width = calculated_width_per_column_emu
+                                # Also set cell width in first row
+                                if len(target_table.rows) > 0:
+                                    header_row = target_table.rows[0]
+                                    if new_col_index < len(header_row.cells):
+                                            header_row.cells[new_col_index].width = calculated_width_per_column_emu
+                            except IndexError:
+                                print(f"      Warning: Index out of bounds setting EMU width for added column {new_col_index}")
+                            except Exception as set_w_e:
+                                print(f"      Warning: Error setting EMU width for added column {new_col_index}: {set_w_e}")
+                        # ---
+                    except Exception as add_col_e:
+                        print(f"      Error adding column {col_idx_to_add + 1}: {add_col_e}. Stopping.")
+                        return
+
+            # --- Set EMU width for the FIRST column ---
+            if calculated_width_per_column_emu is not None and len(target_table.columns) > 0:
+                try:
+                    print(f"    Setting EMU width for initial column 0.")
+                    target_table.columns[0].width = calculated_width_per_column_emu
+                    if len(target_table.rows) > 0:
+                        target_table.rows[0].cells[0].width = calculated_width_per_column_emu
+                except IndexError:
+                    print("     Warning: Could not set EMU width for initial column 0.")
+                except Exception as set_w0_e:
+                    print(f"     Warning: Error setting EMU width for initial column 0: {set_w0_e}")
+            # ---
+
+            # Verify final column count
+            final_cols = len(target_table.columns)
+            print(f"    Table now has {final_cols} columns.")
+            if final_cols < num_needed_cols:
+                print(f"    Error: Failed to add/set sufficient columns. Skipping.")
+                continue
+
+            # --- Populate Headers ---
+            if len(target_table.rows) < 3:
+                print("    Error: Results table template needs >= 3 header rows. Skipping.")
+                continue
+
+            header_row_prose = target_table.rows[0]
+            header_row_step = target_table.rows[1]
+            header_row_req = target_table.rows[2]
+            print(f"    Populating headers across {num_needed_cols} columns...")
+            for c_idx in range(num_needed_cols):
+                if c_idx >= len(header_row_prose.cells): continue # Safety check
+
+                ai_header_text = headers[c_idx]
+                is_standard_col = ai_header_text.count('\n') == 0
+                try:
+                    if is_standard_col:
+                        set_cell_text(header_row_prose.cells[c_idx], ai_header_text)
+                        if c_idx < len(header_row_step.cells): set_cell_text(header_row_step.cells[c_idx], "")
+                        if c_idx < len(header_row_req.cells): set_cell_text(header_row_req.cells[c_idx], "")
+                    else:
+                        header_parts = ai_header_text.split('\n')
+                        prose = header_parts[0] if len(header_parts) > 0 else ""
+                        step_ref = header_parts[1] if len(header_parts) > 1 else ""
+                        req_ref = header_parts[2] if len(header_parts) > 2 else ""
+                        if c_idx < len(header_row_prose.cells): set_cell_text(header_row_prose.cells[c_idx], prose)
+                        if c_idx < len(header_row_step.cells): set_cell_text(header_row_step.cells[c_idx], step_ref)
+                        if c_idx < len(header_row_req.cells): set_cell_text(header_row_req.cells[c_idx], req_ref)
+                except IndexError:
+                    print(f"    Error: Cell index {c_idx} out of range populating headers.")
+
+            # --- Apply Header Formatting (Bold) ---
+            print("    Applying bold formatting to header rows...")
+            num_header_rows = 3
+            for r_idx in range(min(num_header_rows, len(target_table.rows))):
+                row = target_table.rows[r_idx]
+                for c_idx in range(num_needed_cols):
+                    if c_idx < len(row.cells):
+                        cell = row.cells[c_idx]
+                        for paragraph in cell.paragraphs:
+                            for run in paragraph.runs:
+                                run.font.bold = True
+                    else: break
+
+            # --- Manage Data Rows ---
+            num_template_header_rows = 3
+            data_start_row_index = num_template_header_rows
+            existing_data_rows = max(0, len(target_table.rows) - num_template_header_rows)
+            rows_to_add = num_data_rows - existing_data_rows
+            print(f"    Target data rows: {num_data_rows}. Template has: {existing_data_rows}. Need to add: {rows_to_add}")
 
             if rows_to_add > 0:
-                 print(f"    Adding {rows_to_add} data rows...")
-                 for _ in range(rows_to_add):
-                     target_table.add_row()
+                print(f"    Adding {rows_to_add} data rows...")
+                for _ in range(rows_to_add): target_table.add_row()
+            elif rows_to_add < 0:
+                rows_to_remove_count = abs(rows_to_add)
+                print(f"    Removing {rows_to_remove_count} extra template data rows...")
+                for _ in range(rows_to_remove_count):
+                    if len(target_table.rows) > num_template_header_rows:
+                        row_element_to_remove = target_table.rows[-1]._element
+                        if row_element_to_remove.getparent() is not None:
+                            row_element_to_remove.getparent().remove(row_element_to_remove)
+                        else: break
+                    else: break
 
-            # Populate data rows (from RESULTS_TABLE_DATA_START_ROW up to needed rows)
-            num_cols = len(headers)
-            for r_idx_offset in range(num_rows): # Iterate 0 to num_rows-1
-                actual_row_index = self.RESULTS_TABLE_DATA_START_ROW + r_idx_offset
-                if actual_row_index >= len(target_table.rows):
-                    print(f"    Error: Row index {actual_row_index} is out of bounds after adding rows.")
-                    break
+            # --- Populate data rows ---
+            print(f"    Populating {num_data_rows} data rows...")
+            num_cols_to_populate = num_needed_cols
+            for r_idx_offset in range(num_data_rows):
+                actual_row_index = data_start_row_index + r_idx_offset
+                if actual_row_index >= len(target_table.rows): break
                 row = target_table.rows[actual_row_index]
-
-                if len(row.cells) < num_cols:
-                    print(f"    Warning: Row {actual_row_index} has fewer cells ({len(row.cells)}) than headers ({num_cols}). Skipping pop.")
-                    continue
-
-                for c_idx in range(num_cols):
-                    header_lower = headers[c_idx].lower()
+                current_row_cols = len(row.cells)
+                
+                for c_idx in range(min(current_row_cols, num_cols_to_populate)): # Populate up to available cols
+                    header_first_line = headers[c_idx].split('\n')[0].lower()
                     cell = row.cells[c_idx]
-                    # Check if it's the 'No.' column (usually first)
-                    if c_idx == 0 and ("no." in header_lower or "sample" in header_lower):
-                        set_cell_text(cell, str(r_idx_offset + 1)) # Populate 1-based sample number
-                    elif "pass" in header_lower and "fail" in header_lower:
+                    if c_idx == 0 and "no." in header_first_line:
+                        set_cell_text(cell, str(r_idx_offset + 1))
+                    elif "pass" in headers[c_idx].lower() and "fail" in headers[c_idx].lower():
                         set_cell_text(cell, "Pass ☐ / Fail ☐")
-                    elif "sign" in header_lower or "/date" in header_lower:
+                    elif c_idx == num_needed_cols - 1 and ("sign" in header_first_line or "/date" in header_first_line):
                         set_cell_text(cell, "")
                     else:
                         set_cell_text(cell, "") # Clear other data cells
 
-            # Remove extra template data rows if num_rows < template_data_rows
-            if rows_to_add < 0:
-                 rows_to_remove_count = abs(rows_to_add)
-                 print(f"    Removing {rows_to_remove_count} extra template data rows...")
-                 for _ in range(rows_to_remove_count):
-                      # Always remove the last row if it's beyond the needed data rows + header rows
-                      if len(target_table.rows) > (num_rows + num_template_header_rows):
-                           row_element_to_remove = target_table.rows[-1]._element
-                           if row_element_to_remove.getparent() is not None:
-                               row_element_to_remove.getparent().remove(row_element_to_remove)
-                           else: break # Stop if parent gone
-                      else: break # Stop if table size matches target
-
-        except Exception as e:
-            print(f"    Error processing Results Table 1: {e}")
-            import traceback
-            traceback.print_exc()
+            # --- Apply Table Style for Borders ---
+            try:
+                # Use 'Table Grid' for basic borders OR your custom style name
+                # target_style = 'RecordHeaderStyle' # If you created a custom style in Word
+                target_style = 'RecordHeaderStyle'
+                print(f"    Attempting to apply style '{target_style}' to results table {i+1}.")
+                target_table.style = target_style
+                print(f"    Applied style '{target_table.style.name}'.")
+            except Exception as style_e:
+                print(f"    Warning: Could not apply table style '{target_style}'. Error: {style_e}")
 
     def populate_requirements_summary(self):
-        """ Populates the Requirements Summary table (Found dynamically). """
+        """ Populates the Requirements Summary table (Found dynamically) and its preceding title. """
         print("--- Populating Requirements Summary Table ---")
         summary_data = self.ai_analysis.get('requirements_summary', [])
-        if not summary_data:
-            print("  No requirements summary data found in AI analysis.")
-            return
 
+        # --- Find the table FIRST using the preceding paragraph text ---
         target_table = self._find_table_by_preceding_paragraph_text(self.REQUIREMENTS_SUMMARY_TABLE_SEARCH_TEXT)
         if not target_table:
             print(f"  Error: Could not find Requirements Summary table using search text '{self.REQUIREMENTS_SUMMARY_TABLE_SEARCH_TEXT}'.")
-            return
+            return # Cannot proceed without the table
 
+        # --- Set Table Title (in the paragraph found *just before* the table) ---
+        # This logic assumes _find_table_by_preceding_paragraph_text worked correctly
+        table_element = target_table._element
+        parent = table_element.getparent()
+        title_para = None # Initialize title_para
+        if parent is not None:
+            try:
+                table_xml_index = parent.index(table_element)
+                if table_xml_index > 0:
+                    preceding_element = parent[table_xml_index - 1]
+                    if isinstance(preceding_element, CT_P):
+                        # Map the preceding XML paragraph element back to a python-docx Paragraph object
+                        for p in self.doc.paragraphs:
+                            if p._element == preceding_element:
+                                title_para = p
+                                break
+            except ValueError:
+                print("    Warning: Could not determine summary table index within parent.") # Handle case where table might not be direct child
+            except Exception as find_e:
+                print(f"    Warning: Error finding preceding paragraph for summary table title: {find_e}")
+
+        if title_para:
+            # Construct the title dynamically using the requirements from AI analysis
+            req_ids = [req.get('req_id', 'XX') for req in summary_data] # Get all req IDs
+            req_ids_str = " AND ".join(req_ids) if req_ids else "XX" # Join them, handle empty list
+            table_title = f"TABLE 2. REQUIREMENTS {req_ids_str} VERIFICATION" # Construct title
+            print(f"    Setting title in preceding paragraph: '{table_title}'")
+            for run in title_para.runs: run.clear() # Clear existing formatting/text runs
+            title_para.text = table_title # Set the new title text
+            if title_para.runs: title_para.runs[0].font.bold = True # Optionally make it bold
+        else:
+            # This warning indicates the title paragraph wasn't found via the expected structure
+            print(f"    Warning: No paragraph found directly preceding the summary table using search '{self.REQUIREMENTS_SUMMARY_TABLE_SEARCH_TEXT}'. Cannot set title paragraph automatically.")
+        # --- End Title Setting ---
+
+        # Proceed only if there's data to populate
+        if not summary_data:
+            print("  No requirements summary data found in AI analysis. Skipping row population.")
+            # Still attempt cleanup of template rows if necessary
+            template_rows_available = len(target_table.rows) - self.REQ_SUMMARY_START_ROW
+            if template_rows_available > 0:
+                print(f"  Clearing {template_rows_available} template rows in empty summary table.")
+                start_clear_row = self.REQ_SUMMARY_START_ROW
+                for r_idx in range(start_clear_row, len(target_table.rows)):
+                    row = target_table.rows[r_idx]
+                    for cell in row.cells:
+                        set_cell_text(cell, "")
+            return # Exit after handling empty summary_data
+
+        # --- Populate Rows ---
         num_reqs_to_populate = len(summary_data)
         template_rows_available = len(target_table.rows) - self.REQ_SUMMARY_START_ROW
         print(f"  Populating {num_reqs_to_populate} requirements. Template has {template_rows_available} data rows available.")
@@ -695,20 +961,10 @@ class RecordFileGenerator:
                     step_text = req_info.get('step', '') if req_info.get('step', 'N/A') != 'N/A' else ''
                     sub_step_text = req_info.get('sub_step', '') if req_info.get('sub_step', 'N/A') != 'N/A' else ''
                     req_id_text = req_info.get('req_id', '')
-                    verif_text = req_info.get('verification_text', '')
-
-                    # Prepend step/substep to verification text if those columns are missing
-                    prefix = ""
-                    if step_text and self.REQ_SUMMARY_STEP_COL < 0:
-                        prefix += f"Step {step_text}"
-                    if sub_step_text and self.REQ_SUMMARY_SUBSTEP_COL < 0:
-                         prefix += f", Sub-step {sub_step_text}" if prefix else f"Sub-step {sub_step_text}"
-                    if prefix:
-                         verif_text = f"({prefix}): {verif_text}"
+                    verif_text = req_info.get('verification_text', '') # Use original verification text
 
                     # Populate cells using column indices, checking if index is valid (>= 0)
-                    if self.REQ_SUMMARY_STEP_COL >= 0: set_cell_text(row.cells[self.REQ_SUMMARY_STEP_COL], step_text)
-                    if self.REQ_SUMMARY_SUBSTEP_COL >= 0: set_cell_text(row.cells[self.REQ_SUMMARY_SUBSTEP_COL], sub_step_text)
+                    # Step/Substep columns are not populated as indices are -1
                     if self.REQ_SUMMARY_REQID_COL >= 0: set_cell_text(row.cells[self.REQ_SUMMARY_REQID_COL], req_id_text)
                     if self.REQ_SUMMARY_VERIF_COL >= 0: set_cell_text(row.cells[self.REQ_SUMMARY_VERIF_COL], verif_text)
                     if self.REQ_SUMMARY_RESULT_COL >= 0: set_cell_text(row.cells[self.REQ_SUMMARY_RESULT_COL], "Pass ☐ / Fail ☐")
@@ -720,15 +976,28 @@ class RecordFileGenerator:
                     print(f"    Error populating cells in summary row {row_index}: {cell_e}")
 
 
-        # Clear Extra Template Rows
+        # --- Clear Extra Template Rows ---
         if num_reqs_to_populate < template_rows_available:
             rows_to_clear_count = template_rows_available - num_reqs_to_populate
             print(f"  Clearing {rows_to_clear_count} extra rows in summary table template.")
             start_clear_row = self.REQ_SUMMARY_START_ROW + num_reqs_to_populate
-            for r_idx in range(start_clear_row, len(target_table.rows)):
-                 row = target_table.rows[r_idx]
-                 for cell in row.cells:
-                     set_cell_text(cell, "")
+            # Iterate backwards when removing to avoid index issues
+            for r_idx in range(len(target_table.rows) - 1, start_clear_row - 1, -1):
+                row = target_table.rows[r_idx]
+                for cell in row.cells:
+                    set_cell_text(cell, "") # Clear content of extra rows
+
+        # --- Final Cleanup: Remove any rows beyond what was populated ---
+        # This loop ensures the table has exactly the right number of rows at the end
+        final_expected_rows = self.REQ_SUMMARY_START_ROW + num_reqs_to_populate
+        while len(target_table.rows) > final_expected_rows:
+            print(f"  Removing extra trailing row {len(target_table.rows)} from summary table.")
+            row_element_to_remove = target_table.rows[-1]._element
+            if row_element_to_remove.getparent() is not None:
+                row_element_to_remove.getparent().remove(row_element_to_remove)
+            else:
+                print("    Warning: Could not remove extra summary row, parent not found.")
+                break # Avoid infinite loop
 
     def save(self, output_path: str):
         """ Saves the populated document. """
@@ -753,10 +1022,11 @@ def main():
     TESTRAIL_EMAIL = os.environ.get("TESTRAIL_EMAIL", "jairo.rodriguez@icumed.com")
     TESTRAIL_API_KEY = os.environ.get("TESTRAIL_API_KEY", "uttDDNwG5EMQeiW71KaN-3l9Ndf4mBqWT0xV7TF5F")
 
-    test_case_id_to_process = 983037 # Functional Example 2
+    # test_case_id_to_process = 1043745 # Functional Example 2
+    test_case_id_to_process = 1043779 # Functional Example 2
 
     # Template file paths (Adjust as necessary)
-    template_dir = r'C:\Users\JR00093781\OneDrive - ICU Medical Inc\Documents\TestRecordGenerator\Templates'
+    template_dir = r'C:\Users\JR00093781\OneDrive - ICU Medical Inc\Documents\TestRecordGenerator\v2\Templates'
     template_file_functional = os.path.join(template_dir, 'Functional_Template_Base.docx')
     template_file_performance = os.path.join(template_dir, 'Performance_Template_Base.docx') # Assuming it exists
     template_file_inspection = os.path.join(template_dir, 'Inspection_Template_Base.docx') # Assuming it exists
@@ -802,6 +1072,7 @@ def main():
 
     try:
         generator = RecordFileGenerator(template_file_to_use, testrail_data, ai_analysis)
+        generator.populate_header()
         generator.populate_title()
         generator.populate_general_info()
         generator.populate_equipment()
